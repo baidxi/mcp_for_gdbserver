@@ -1,0 +1,22 @@
+{
+  "gdb_path": "arm-none-eabi-gdb",
+  "host": "0.0.0.0",
+  "port": 8765,
+  "default_target": null,
+  "gdb_init_commands": [
+    "set pagination off",
+    "set confirm off"
+  ],
+  "timeout_seconds": 30,
+  "log_level": "INFO",
+
+  "gdbserver": {
+    "mode": "standard",
+    "port": 50000,
+    "multi": true,
+    "once": false,
+    "attach_pid": null,
+    "args": [],
+    "command": null
+  }
+}

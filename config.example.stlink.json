@@ -1,0 +1,17 @@
+{
+  "gdb_path": "arm-zephyr-eabi-gdb",
+  "host": "0.0.0.0",
+  "port": 8765,
+  "default_target": "localhost:50000",
+  "gdb_init_commands": [
+    "set pagination off",
+    "set confirm off"
+  ],
+  "timeout_seconds": 30,
+  "log_level": "INFO",
+
+  "gdbserver": {
+    "mode": "custom",
+    "command": "~/STMicroelectronics/stm32cubeclt_1.19.0/STLink-gdb-server/bin/ST-LINK_gdbserver -p 50000 -cp /usr/local/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin --swd --halt"
+  }
+}
