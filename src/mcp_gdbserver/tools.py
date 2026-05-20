@@ -296,6 +296,34 @@ def register_tools(mcp: FastMCP) -> None:
             return str(_result_dict(False, f"Disconnect error: {e}"))
 
     @mcp.tool()
+    async def attach(
+        pid: Annotated[int, Field(description="要附加到的目标进程 PID")],
+    ) -> str:
+        """附加到正在运行的进程。
+
+        GDB 会附加到指定 PID 的进程并暂停其执行。
+        需要 GDB 有足够的权限（可能需要 sudo 或设置 ptrace_scope）。
+        """
+        ctx = get_context()
+        session = ctx.ensure_session()
+
+        try:
+            output = await session.send_mi_command(f"-target-attach {pid}")
+            if output.is_error:
+                return str(_result_dict(False, f"Attach failed: {output.error_message}"))
+
+            ctx.session._state = GDBState.STOPPED
+            return str(_result_dict(
+                True,
+                f"Attached to process {pid}",
+                pid=pid,
+                state=ctx.session.state.value,
+                console=strip_ansi(output.console_output.strip()) if output.console_output else "",
+            ))
+        except Exception as e:
+            return str(_result_dict(False, f"Attach error: {e}"))
+
+    @mcp.tool()
     async def load_file(
         file_path: Annotated[str, Field(description="ELF 可执行文件的绝对路径 (服务器本地路径)")],
     ) -> str:
