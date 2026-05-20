@@ -485,6 +485,28 @@ def register_tools(mcp: FastMCP) -> None:
         except Exception as e:
             return str(_result_dict(False, f"Restart error: {e}"))
 
+    @mcp.tool()
+    async def reset_target(
+        halt: Annotated[bool, Field(description="复位后是否暂停目标 (默认: True). True=monitor reset halt, False=monitor reset")] = True,
+    ) -> str:
+        """复位目标芯片 (通过 monitor 命令)。
+
+        发送 ``monitor reset halt`` (halt=True) 或 ``monitor reset`` (halt=False)。
+        ``monitor reset halt`` 会将芯片复位并停在复位向量处，适合调试场景。
+        """
+        ctx = get_context()
+        session = ctx.ensure_session()
+
+        cmd = "monitor reset halt" if halt else "monitor reset"
+        try:
+            # Use send_raw_command instead of send_cli_command because
+            # ST-LINK GDB server may return ^error for successful monitor
+            # commands (protocol quirk with Rcmd responses).
+            text = await session.send_raw_command(cmd)
+            return str(_result_dict(True, f"Reset via '{cmd}'", output=text.strip() or "OK"))
+        except Exception as e:
+            return str(_result_dict(False, f"Reset error: {e}"))
+
     # =======================================================================
     # 5.3 断点工具 (Breakpoint Tools)
     # =======================================================================

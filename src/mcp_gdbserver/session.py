@@ -366,8 +366,9 @@ class GDBSession:
         Args:
             command: MI command (e.g. "-break-insert main")
             timeout: Response timeout in seconds (uses default if None)
-            log_command: When True (default), echoes the command and result
-                to the ``mcp_gdbserver.command`` logger at INFO level.
+            log_command: When True (default), echoes the sent command
+                (``→ GDB: ...``) to the ``mcp_gdbserver.command`` logger
+                at INFO level.  The result (``← ...``) is *always* logged.
 
         Returns:
             MIOutput containing the parsed response, including any
@@ -399,14 +400,12 @@ class GDBSession:
         try:
             # Wait for response with timeout
             result = await self._wait_for_future(future, timeout)
-            if log_command:
-                cmd_logger.info("←      %s", _brief_result(result))
+            cmd_logger.info("←      %s", _brief_result(result))
             return result
         except asyncio.TimeoutError:
             self._pending.pop(token, None)
             self._pending_streams.pop(token, None)
-            if log_command:
-                cmd_logger.info("←      Timeout")
+            cmd_logger.info("←      Timeout")
             raise GDBSessionError(
                 f"Timeout ({timeout}s) waiting for response to: {command}"
             )
