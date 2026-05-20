@@ -26,10 +26,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class AppContext:
-    """Shared application context for tools."""
+    """Shared application context for tools.
+
+    Supports multiple named GDB sessions via a dictionary keyed by session_id.
+    The ``active_session_id`` determines which session is used by default.
+    """
+
+    DEFAULT_SESSION = "default"
 
     def __init__(self) -> None:
-        self.session = GDBSession()
+        self._sessions: dict[str, GDBSession] = {}
+        self.active_session_id: str = self.DEFAULT_SESSION
         self.server_mgr: Optional[GdbServerManager] = None
         self.gdbserver_config: Optional[GdbServerConfig] = None
         # Configuration defaults loaded from config file / CLI
@@ -38,11 +45,37 @@ class AppContext:
         self.default_target: Optional[str] = None
         self.timeout_seconds: float = 30.0
 
-    def ensure_session(self) -> GDBSession:
-        """Get the GDB session, raising an error if not started."""
-        if not self.session.is_alive:
-            raise ValueError("GDB session is not started. Call start_gdb / connect first.")
-        return self.session
+    @property
+    def sessions(self) -> dict[str, GDBSession]:
+        """Read-only view of all sessions."""
+        return dict(self._sessions)
+
+    def get_session(self, session_id: str | None = None) -> GDBSession:
+        """Get a session by id, creating it if it does not exist."""
+        sid = session_id or self.active_session_id
+        if sid not in self._sessions:
+            self._sessions[sid] = GDBSession()
+        return self._sessions[sid]
+
+    def ensure_session(self, session_id: str | None = None) -> GDBSession:
+        """Get an *alive* session, raising if not started."""
+        session = self.get_session(session_id)
+        if not session.is_alive:
+            sid = session_id or self.active_session_id
+            raise ValueError(
+                f"GDB session '{sid}' is not started. Call start_gdb first."
+            )
+        return session
+
+    def drop_session(self, session_id: str) -> bool:
+        """Remove a session from tracking (does NOT quit GDB)."""
+        return self._sessions.pop(session_id, None) is not None
+
+    # Backward-compatible alias
+    @property
+    def session(self) -> GDBSession:
+        """The currently active session (backward-compat)."""
+        return self.get_session()
 
 
 # Global context — will be set during server initialization
@@ -206,16 +239,19 @@ def register_tools(mcp: FastMCP) -> None:
     async def start_gdb(
         gdb_path: Annotated[str, Field(description="GDB 可执行文件路径")] = "",
         init_commands: Annotated[list[str] | None, Field(description="GDB 启动后执行的初始化命令列表")] = None,
+        session_id: Annotated[str | None, Field(description="会话标识符 (默认: 'default')，可同时运行多个独立 GDB 实例")] = None,
     ) -> str:
         """启动 GDB 进程 (MI3 模式)。
 
-        如果已有 GDB 进程在运行，会先退出旧的。
+        如果已有同名 session 在运行，会先退出旧的。
         如不提供参数，则使用配置文件中的默认值。
+        使用不同的 session_id 可以同时运行多个独立的 GDB 实例。
         """
         ctx = get_context()
+        session = ctx.get_session(session_id)
 
-        if ctx.session.is_alive:
-            await ctx.session.quit()
+        if session.is_alive:
+            await session.quit()
 
         # 使用传入参数，或回退到配置文件中的默认值
         effective_gdb_path = gdb_path or ctx.gdb_path
@@ -223,18 +259,22 @@ def register_tools(mcp: FastMCP) -> None:
         if init_commands:
             effective_init.extend(init_commands)
 
-        ctx.session = GDBSession(
+        new_session = GDBSession(
             gdb_path=effective_gdb_path,
             init_commands=effective_init,
         )
+        # Replace the session in the dict
+        sid = session_id or ctx.active_session_id
+        ctx._sessions[sid] = new_session
 
         try:
-            await ctx.session.start()
+            await new_session.start()
             return str(_result_dict(
                 True,
-                f"GDB started (PID={ctx.session.pid})",
-                pid=ctx.session.pid,
-                state=ctx.session.state.value,
+                f"GDB started (PID={new_session.pid}, session='{sid}')",
+                pid=new_session.pid,
+                session_id=sid,
+                state=new_session.state.value,
             ))
         except Exception as e:
             return str(_result_dict(False, f"Failed to start GDB: {e}"))
@@ -366,28 +406,87 @@ def register_tools(mcp: FastMCP) -> None:
             return str(_result_dict(False, f"Load error: {e}"))
 
     @mcp.tool()
-    async def quit() -> str:
+    async def quit(
+        session_id: Annotated[str | None, Field(description="会话标识符 (默认: 当前活跃 session)")] = None,
+    ) -> str:
         """关闭 GDB 进程并清理资源。"""
         ctx = get_context()
 
         try:
-            await ctx.session.quit()
-            return str(_result_dict(True, "GDB exited"))
+            session = ctx.get_session(session_id)
+            await session.quit()
+            sid = session_id or ctx.active_session_id
+            ctx.drop_session(sid)
+            return str(_result_dict(True, f"GDB session '{sid}' exited"))
         except Exception as e:
             return str(_result_dict(False, f"Quit error: {e}"))
 
     @mcp.tool()
     async def get_status() -> str:
-        """获取当前调试器状态。"""
+        """获取当前调试器状态（包含所有 session）。"""
         ctx = get_context()
 
-        status = ctx.session.get_status()
-        # Show configured GDB path (from config file) even before GDB is started
-        status["gdb_path"] = ctx.gdb_path
+        all_sessions = {}
+        for sid, s in ctx.sessions.items():
+            all_sessions[sid] = s.get_status()
+            all_sessions[sid]["gdb_path"] = ctx.gdb_path
+
+        status = {
+            "active_session": ctx.active_session_id,
+            "sessions": all_sessions,
+        }
         if ctx.server_mgr:
             status["gdb_server"] = ctx.server_mgr.get_status()
 
         return str(_result_dict(True, "Status retrieved", **status))
+
+    @mcp.tool()
+    async def switch_session(
+        session_id: Annotated[str, Field(description="要切换到的会话标识符")],
+    ) -> str:
+        """切换到指定的 GDB 会话。
+
+        后续所有工具调用（如 continue, break_insert, print 等）都将
+        作用于该会话。使用 list_sessions 查看所有可用会话。
+        """
+        ctx = get_context()
+
+        if session_id not in ctx._sessions:
+            available = list(ctx._sessions.keys()) or ["(none)"]
+            return str(_result_dict(
+                False,
+                f"Session '{session_id}' not found. Available: {', '.join(available)}",
+            ))
+
+        ctx.active_session_id = session_id
+        session = ctx._sessions[session_id]
+        return str(_result_dict(
+            True,
+            f"Switched to session '{session_id}' (alive={session.is_alive})",
+            session_id=session_id,
+            alive=session.is_alive,
+        ))
+
+    @mcp.tool()
+    async def list_sessions() -> str:
+        """列出所有 GDB 会话及其状态。"""
+        ctx = get_context()
+
+        result = {}
+        for sid, s in ctx.sessions.items():
+            result[sid] = {
+                "alive": s.is_alive,
+                "pid": s.pid,
+                "state": s.state.value,
+                "loaded_file": s.loaded_file,
+            }
+
+        return str(_result_dict(
+            True,
+            f"{len(result)} session(s)",
+            active=ctx.active_session_id,
+            sessions=result,
+        ))
 
     # =======================================================================
     # 5.2 执行控制工具 (Execution Control Tools)
