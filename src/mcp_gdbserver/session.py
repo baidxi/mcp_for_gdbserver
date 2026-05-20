@@ -11,6 +11,7 @@ Manages a GDB subprocess running in MI3 mode, providing:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import pty
@@ -31,6 +32,36 @@ from .mi_parser import (
 )
 
 logger = logging.getLogger(__name__)
+cmd_logger = logging.getLogger("mcp_gdbserver.command")
+
+
+def _brief_result(output: MIOutput) -> str:
+    """Generate a brief human-readable summary of an MI command result.
+
+    Used for command-echo logging so that every GDB command and its
+    response are visible in the server terminal at INFO level.
+
+    Args:
+        output: Parsed MI output from a command execution.
+
+    Returns:
+        A string summary, truncated to ~500 characters for readability.
+    """
+    if output.is_error:
+        return f"Error: {output.error_message}"
+    if output.console_output:
+        text = output.console_output.strip()
+        # Trim to at most 500 characters to avoid flooding the terminal
+        return text[:500] + ("..." if len(text) > 500 else "")
+    if output.result and output.result.results:
+        try:
+            formatted = json.dumps(
+                output.result.results, indent=2, ensure_ascii=False
+            )
+        except (TypeError, ValueError):
+            formatted = str(output.result.results)
+        return formatted[:500] + ("..." if len(formatted) > 500 else "")
+    return "OK"
 
 
 class GDBState(Enum):
@@ -326,6 +357,7 @@ class GDBSession:
         self,
         command: str,
         timeout: float | None = None,
+        log_command: bool = True,
     ) -> MIOutput:
         """Send a GDB MI command and wait for the response.
 
@@ -334,6 +366,8 @@ class GDBSession:
         Args:
             command: MI command (e.g. "-break-insert main")
             timeout: Response timeout in seconds (uses default if None)
+            log_command: When True (default), echoes the command and result
+                to the ``mcp_gdbserver.command`` logger at INFO level.
 
         Returns:
             MIOutput containing the parsed response, including any
@@ -356,15 +390,23 @@ class GDBSession:
         # Send command with token prefix
         full_command = f"{token}{command}\n"
         logger.debug("Sending MI: %s", full_command.strip())
+
+        if log_command:
+            cmd_logger.info("→ GDB: %s", command)
+
         self._write(full_command)
 
         try:
             # Wait for response with timeout
             result = await self._wait_for_future(future, timeout)
+            if log_command:
+                cmd_logger.info("←      %s", _brief_result(result))
             return result
         except asyncio.TimeoutError:
             self._pending.pop(token, None)
             self._pending_streams.pop(token, None)
+            if log_command:
+                cmd_logger.info("←      Timeout")
             raise GDBSessionError(
                 f"Timeout ({timeout}s) waiting for response to: {command}"
             )
@@ -402,11 +444,15 @@ class GDBSession:
             MIOutput containing the parsed response, with console_output
             populated from the accumulated stream records.
         """
+        # Log the original CLI command before wrapping it in MI
+        cmd_logger.info("→ GDB: %s", command)
+
         # Escape quotes in the command
         escaped = command.replace("\\", "\\\\").replace('"', '\\"')
         return await self.send_mi_command(
             f'-interpreter-exec console "{escaped}"',
             timeout=timeout,
+            log_command=False,
         )
 
     async def send_raw_command(
@@ -437,6 +483,7 @@ class GDBSession:
         """Send Ctrl+C (SIGINT) to the GDB process to interrupt the target."""
         if not self.is_alive:
             raise GDBSessionError("GDB is not running")
+        cmd_logger.info("→ GDB: <SIGINT>")
         logger.info("Sending interrupt (Ctrl+C) to GDB (PID=%d)", self.pid)
         try:
             os.kill(self._process.pid, signal.SIGINT)
