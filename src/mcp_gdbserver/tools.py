@@ -67,13 +67,38 @@ def set_context(ctx: AppContext) -> None:
 # Helper functions
 # ---------------------------------------------------------------------------
 
+import re
+
+# Regex to match ANSI escape sequences.
+# MI3 mode outputs them as literal "\e[...m" strings (not raw ESC bytes),
+# but we also handle raw ESC (0x1b) in case direct terminal output is mixed in.
+_ANSI_ESCAPE_RE = re.compile(
+    r"(?:\x1b|\\e)"                     # ESC byte OR literal \e
+    r"(?:"
+    r"\[[0-9;]*[a-zA-Z]|"              # CSI: colors, cursor, SGR
+    r"\]8;[^\x07]*?(?:\x1b|\\e)\\\\"   # OSC 8 hyperlink
+    r")"
+)
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from a string.
+    
+    Used to clean pwndbg output (and other colored GDB output) before
+    returning to MCP clients, since JSON serialization would otherwise
+    escape the raw escape bytes into unreadable sequences.
+    """
+    if not text:
+        return text
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
 def _format_output(output: Any) -> str:
     """Format a MI output result as a human-readable string."""
     if hasattr(output, "console_output"):
         # It's an MIOutput
         if output.is_error:
             return f"Error: {output.error_message}"
-        text = output.console_output.strip()
+        text = strip_ansi(output.console_output.strip())
         if text:
             return text
         # Return structured results if no console text

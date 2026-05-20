@@ -34,6 +34,23 @@ from .mi_parser import (
 logger = logging.getLogger(__name__)
 cmd_logger = logging.getLogger("mcp_gdbserver.command")
 
+# Regex to match ANSI escape sequences.
+# MI3 mode outputs them as literal "\e[...m" strings (not raw ESC bytes),
+# but we also handle raw ESC (0x1b) in case direct terminal output is mixed in.
+_ANSI_ESCAPE_RE = re.compile(
+    r"(?:\x1b|\\e)"                     # ESC byte OR literal \e
+    r"(?:"
+    r"\[[0-9;]*[a-zA-Z]|"              # CSI: colors, cursor, SGR
+    r"\]8;[^\x07]*?(?:\x1b|\\e)\\\\"   # OSC 8 hyperlink
+    r")"
+)
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences so output renders cleanly through JSON."""
+    if not text:
+        return text
+    return _ANSI_ESCAPE_RE.sub("", text)
+
 
 def _brief_result(output: MIOutput) -> str:
     """Generate a brief human-readable summary of an MI command result.
@@ -50,7 +67,7 @@ def _brief_result(output: MIOutput) -> str:
     if output.is_error:
         return f"Error: {output.error_message}"
     if output.console_output:
-        text = output.console_output.strip()
+        text = _strip_ansi(output.console_output.strip())
         # Trim to at most 500 characters to avoid flooding the terminal
         return text[:500] + ("..." if len(text) > 500 else "")
     if output.result and output.result.results:
@@ -467,7 +484,9 @@ class GDBSession:
         Returns the concatenated console stream output.
         """
         output = await self.send_cli_command(command, timeout=timeout)
-        return output.console_output
+        # Strip ANSI escape codes (pwndbg uses them extensively) so the
+        # output renders cleanly through MCP JSON serialization.
+        return _strip_ansi(output.console_output)
 
     def _write(self, data: str) -> None:
         """Write data to the PTY master fd."""
