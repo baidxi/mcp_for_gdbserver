@@ -141,6 +141,162 @@ def _format_output(output: Any) -> str:
     return str(output)
 
 
+def _format_mi_results(results: dict[str, Any]) -> str:
+    """Format MI result data as a human-readable text (GDB CLI style).
+
+    Handles common MI result structures:
+    - stack  → backtrace (GDB bt style)
+    - threads → thread list
+    - frame  → frame info
+    - Anything else → pretty JSON
+    """
+    if not results:
+        return "OK"
+
+    # ── stack (from -stack-list-frames) ──────────────────────────────
+    stack = results.get("stack")
+    if stack is not None and isinstance(stack, list):
+        lines = []
+        for entry in stack:
+            frame = entry.get("frame", entry) if isinstance(entry, dict) else entry
+            if not isinstance(frame, dict):
+                continue
+            level = str(frame.get("level", "?"))
+            func = frame.get("func", "??")
+            addr = frame.get("addr", "??")
+            file_ = frame.get("file", frame.get("fullname", None))
+            line = frame.get("line", None)
+
+            if level == "0":
+                prefix = f"#0  "
+            else:
+                prefix = f"#{level}  {addr} in "
+
+            func_part = f"{func} ()"
+            loc_parts = []
+            if file_:
+                loc_part = file_
+                if line:
+                    loc_part += f":{line}"
+                loc_parts.append(f"at {loc_part}")
+
+            line_text = prefix + func_part
+            if loc_parts:
+                line_text += " " + " ".join(loc_parts)
+            lines.append(line_text)
+        if lines:
+            return "\n".join(lines)
+
+    # ── stack-args (from -stack-list-arguments) ──────────────────────
+    stack_args = results.get("stack-args")
+    if stack_args is not None and isinstance(stack_args, list):
+        lines = []
+        for entry in stack_args:
+            frame = entry.get("frame", {})
+            level = str(frame.get("level", "?"))
+            args_list = frame.get("args", [])
+            real_args = [a for a in args_list if not a.get("name", "").endswith("@entry")]
+            if real_args:
+                args_str = ", ".join(f"{a['name']}={a['value']}" for a in real_args)
+                lines.append(f"  Frame #{level}: {args_str}")
+            else:
+                lines.append(f"  Frame #{level}: (no arguments)")
+        if lines:
+            return "\n".join(lines)
+
+    # ── threads (from -thread-info) ──────────────────────────────────
+    threads = results.get("threads")
+    if threads is not None and isinstance(threads, list):
+        current = results.get("current-thread-id")
+        lines = []
+        for t in threads:
+            tid = t.get("id", "?")
+            target_id = t.get("target-id", "?")
+            state = t.get("state", "?")
+            frame = t.get("frame", {})
+            func = frame.get("func", "??") if frame else "??"
+            marker = " *" if str(tid) == str(current) else ""
+            lines.append(f"  Thread {tid} ({target_id}): {state} in {func}{marker}")
+        if lines:
+            return "\n".join(lines)
+
+    # ── frame (from -stack-info-frame) ───────────────────────────────
+    frame = results.get("frame")
+    if frame is not None and isinstance(frame, dict):
+        level = frame.get("level", "?")
+        func = frame.get("func", "??")
+        addr = frame.get("addr", "??")
+        file_ = frame.get("file", frame.get("fullname", None))
+        line = frame.get("line", None)
+        parts = [f"Frame #{level}: {addr} in {func}"]
+        if file_:
+            fl = file_
+            if line:
+                fl += f":{line}"
+            parts.append(f"at {fl}")
+        return " ".join(parts)
+
+    # ── bkpt (from -break-insert) ────────────────────────────────────
+    bkpt = results.get("bkpt")
+    if bkpt is not None and isinstance(bkpt, dict):
+        num = bkpt.get("number", "?")
+        func = bkpt.get("func", bkpt.get("original-location", "?"))
+        file_ = bkpt.get("file", "??")
+        line = bkpt.get("line", "?")
+        return f"Breakpoint {num} at {file_}:{line}, {func}"
+
+    # ── BreakpointTable (from -break-list) ────────────────────────────
+    bptable = results.get("BreakpointTable")
+    if bptable is not None and isinstance(bptable, dict):
+        body = bptable.get("body", [])
+        lines = []
+        for entry in body:
+            bkpt = entry.get("bkpt", entry) if isinstance(entry, dict) else entry
+            if not isinstance(bkpt, dict):
+                continue
+            num = bkpt.get("number", "?")
+            func = bkpt.get("func", bkpt.get("original-location", "?"))
+            file_ = bkpt.get("file", "??")
+            line = bkpt.get("line", "?")
+            addr = bkpt.get("addr", "??")
+            enabled = bkpt.get("enabled", "y") == "y"
+            enb = "y" if enabled else "n"
+            disp = bkpt.get("disp", "keep")
+            btype = bkpt.get("type", "breakpoint")
+            lines.append(f"  {num:<4} {btype:<12} {disp:<6} {enb:<3} {addr:<18} in {func} at {file_}:{line}")
+        if lines:
+            return "\n".join(lines)
+
+    # ── memory (from -data-read-memory-bytes) ────────────────────────
+    memory = results.get("memory")
+    if memory is not None and isinstance(memory, list):
+        lines = []
+        for block in memory:
+            addr = block.get("address", "?")
+            data = block.get("contents", [])
+            hex_bytes = " ".join(b.get("value", "??") for b in data) if isinstance(data, list) else str(data)
+            lines.append(f"  {addr}: {hex_bytes}")
+        return "\n".join(lines) if lines else "No memory data"
+
+    # ── variables (from -stack-list-variables) ───────────────────────
+    variables = results.get("variables")
+    if variables is not None and isinstance(variables, list):
+        lines = []
+        for var in variables:
+            name = var.get("name", "?")
+            value = var.get("value", "?")
+            lines.append(f"  {name} = {value}")
+        if lines:
+            return "\n".join(lines)
+
+    # ── Fallback: pretty JSON ────────────────────────────────────────
+    try:
+        import json
+        return json.dumps(results, indent=2, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(results)
+
+
 def _result_dict(success: bool, message: str, **kwargs: Any) -> dict[str, Any]:
     """Create a standardized result dictionary."""
     result = {"success": success, "message": message}
@@ -909,32 +1065,97 @@ def register_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def backtrace(
-        count: Annotated[int | None, Field(description="显示的栈帧数量 (可选, 默认全部)")] = None,
+        count: Annotated[int | None, Field(description="显示的栈帧数量 (可选, 默认全部)。正数显示前 N 帧，负数显示后 N 帧")] = None,
         full: Annotated[bool, Field(description="是否同时显示局部变量")] = False,
     ) -> str:
-        """显示调用栈。"""
+        """显示调用栈。
+
+        格式化输出与 GDB ``bt`` 命令风格一致，包含函数地址、参数、文件名和行号。
+        不再返回原始 frames 数据结构。
+        """
         ctx = get_context()
         session = ctx.ensure_session()
 
         try:
-            output = await session.send_mi_command("-stack-list-frames")
-            if output.is_error:
-                return str(_result_dict(False, f"Backtrace failed: {output.error_message}"))
+            # 1) 获取栈帧列表
+            frames_output = await session.send_mi_command("-stack-list-frames")
+            if frames_output.is_error:
+                return str(_result_dict(False, f"Backtrace failed: {frames_output.error_message}"))
 
-            frames = output.result.results.get("stack", []) if output.result else []
+            frames = frames_output.result.results.get("stack", []) if frames_output.result else []
 
+            # 2) 获取函数参数
+            args_output = await session.send_mi_command("-stack-list-arguments --all-values")
+            args_by_level: dict[str, list[dict]] = {}
+            if args_output.result and not args_output.is_error:
+                stack_args = args_output.result.results.get("stack-args", [])
+                for entry in stack_args:
+                    frame = entry.get("frame", {})
+                    level = str(frame.get("level", ""))
+                    args_list = frame.get("args", [])
+                    # 只显示有实际参数的帧
+                    if args_list:
+                        # 过滤掉 @entry 后缀的参数（GDB bt 不显示它们）
+                        real_args = [a for a in args_list if not a.get("name", "").endswith("@entry")]
+                        if real_args:
+                            args_by_level[level] = real_args
+
+            # 3) 构建格式化输出
             result_text = ""
-            if frames:
-                for frame_entry in frames:
-                    frame = frame_entry.get("frame", frame_entry) if isinstance(frame_entry, dict) else frame_entry
-                    level = frame.get("level", "?")
-                    func = frame.get("func", "??")
-                    file_ = frame.get("file", frame.get("fullname", "??"))
-                    line = frame.get("line", "?")
-                    addr = frame.get("addr", "??")
-                    result_text += f"#{level} {func} at {file_}:{line} (addr={addr})\n"
+            num_frames = len(frames)
 
-            if full:
+            # 应用 count 限制
+            start_idx = 0
+            end_idx = num_frames
+            if count is not None:
+                if count > 0:
+                    end_idx = min(count, num_frames)
+                elif count < 0:
+                    start_idx = max(0, num_frames + count)
+
+            for i in range(start_idx, end_idx):
+                frame_entry = frames[i]
+                frame = frame_entry.get("frame", frame_entry) if isinstance(frame_entry, dict) else frame_entry
+                level = str(frame.get("level", "?"))
+                func = frame.get("func", "??")
+                file_ = frame.get("file", frame.get("fullname", None))
+                line = frame.get("line", None)
+                addr = frame.get("addr", "??")
+
+                # 获取该帧的函数参数
+                frame_args = args_by_level.get(level, [])
+                args_str = ", ".join(f"{a['name']}={a['value']}" for a in frame_args) if frame_args else ""
+
+                # GDB bt 格式:
+                #   #0  func (args) at file:line          (当前帧，无地址前缀)
+                #   #N  0xADDR in func (args) at file:line (其他帧)
+                if level == "0":
+                    prefix = f"#0  "
+                else:
+                    prefix = f"#{level}  {addr} in "
+
+                # 格式化: func (args)
+                if args_str:
+                    func_part = f"{func} ({args_str})"
+                else:
+                    func_part = f"{func} ()"
+
+                # 格式化: at file:line
+                loc_parts = []
+                if file_:
+                    loc_part = file_
+                    if line:
+                        loc_part += f":{line}"
+                    loc_parts.append(f"at {loc_part}")
+
+                line_text = prefix + func_part
+                if loc_parts:
+                    line_text += " " + " ".join(loc_parts)
+
+                result_text += line_text + "\n"
+
+            # 4) full 模式：显示局部变量（仅当前帧）
+            if full and frames:
                 try:
                     vars_output = await session.send_mi_command("-stack-list-variables --all-values")
                     if vars_output.result:
@@ -951,7 +1172,6 @@ def register_tools(mcp: FastMCP) -> None:
             return str(_result_dict(
                 True,
                 result_text.strip() if result_text.strip() else "No backtrace available",
-                frames=frames,
             ))
         except Exception as e:
             return str(_result_dict(False, f"Backtrace error: {e}"))

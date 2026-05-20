@@ -52,11 +52,145 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text)
 
 
+def _format_mi_result(results: dict[str, Any]) -> str:
+    """将 MI 结构化结果格式化为 GDB CLI 风格的文本（用于日志输出）。
+
+    与 tools.py 中的 _format_mi_results 保持一致的格式。
+    """
+    if not results:
+        return "OK"
+
+    # stack (from -stack-list-frames)
+    stack = results.get("stack")
+    if stack is not None and isinstance(stack, list):
+        lines = []
+        for entry in stack:
+            frame = entry.get("frame", entry) if isinstance(entry, dict) else entry
+            if not isinstance(frame, dict):
+                continue
+            level = str(frame.get("level", "?"))
+            func = frame.get("func", "??")
+            addr = frame.get("addr", "??")
+            file_ = frame.get("file", frame.get("fullname", None))
+            line = frame.get("line", None)
+            if level == "0":
+                prefix = f"#0  "
+            else:
+                prefix = f"#{level}  {addr} in "
+            func_part = f"{func} ()"
+            line_text = prefix + func_part
+            if file_:
+                line_text += f" at {file_}"
+                if line:
+                    line_text += f":{line}"
+            lines.append(line_text)
+        if lines:
+            return "\n".join(lines)
+
+    # stack-args (from -stack-list-arguments)
+    stack_args = results.get("stack-args")
+    if stack_args is not None and isinstance(stack_args, list):
+        lines = []
+        for entry in stack_args:
+            frame = entry.get("frame", {})
+            level = str(frame.get("level", "?"))
+            args_list = frame.get("args", [])
+            real_args = [a for a in args_list if not a.get("name", "").endswith("@entry")]
+            if real_args:
+                args_str = ", ".join(f"{a['name']}={a['value']}" for a in real_args)
+                lines.append(f"  Frame #{level}: {args_str}")
+        if lines:
+            return "\n".join(lines)
+
+    # threads (from -thread-info)
+    threads = results.get("threads")
+    if threads is not None and isinstance(threads, list):
+        current = results.get("current-thread-id")
+        lines = []
+        for t in threads:
+            tid = t.get("id", "?")
+            target_id = t.get("target-id", "?")
+            state = t.get("state", "?")
+            frame = t.get("frame", {})
+            func = frame.get("func", "??") if frame else "??"
+            marker = " *" if str(tid) == str(current) else ""
+            lines.append(f"  Thread {tid} ({target_id}): {state} in {func}{marker}")
+        if lines:
+            return "\n".join(lines)
+
+    # frame (from -stack-info-frame)
+    frame = results.get("frame")
+    if frame is not None and isinstance(frame, dict):
+        level = frame.get("level", "?")
+        func = frame.get("func", "??")
+        addr = frame.get("addr", "??")
+        file_ = frame.get("file", frame.get("fullname", None))
+        line = frame.get("line", None)
+        parts = [f"Frame #{level}: {addr} in {func}"]
+        if file_:
+            fl = file_
+            if line:
+                fl += f":{line}"
+            parts.append(f"at {fl}")
+        return " ".join(parts)
+
+    # bkpt (from -break-insert)
+    bkpt = results.get("bkpt")
+    if bkpt is not None and isinstance(bkpt, dict):
+        num = bkpt.get("number", "?")
+        func = bkpt.get("func", bkpt.get("original-location", "?"))
+        file_ = bkpt.get("file", "??")
+        line = bkpt.get("line", "?")
+        return f"Breakpoint {num} at {file_}:{line}, {func}"
+
+    # BreakpointTable (from -break-list)
+    bptable = results.get("BreakpointTable")
+    if bptable is not None and isinstance(bptable, dict):
+        body = bptable.get("body", [])
+        lines = []
+        for entry in body:
+            bkpt = entry.get("bkpt", entry) if isinstance(entry, dict) else entry
+            if not isinstance(bkpt, dict):
+                continue
+            num = bkpt.get("number", "?")
+            func = bkpt.get("func", bkpt.get("original-location", "?"))
+            file_ = bkpt.get("file", "??")
+            line = bkpt.get("line", "?")
+            addr = bkpt.get("addr", "??")
+            enabled = bkpt.get("enabled", "y") == "y"
+            enb = "y" if enabled else "n"
+            disp = bkpt.get("disp", "keep")
+            btype = bkpt.get("type", "breakpoint")
+            lines.append(f"  {num:<4} {btype:<12} {disp:<6} {enb:<3} {addr:<18} in {func} at {file_}:{line}")
+        if lines:
+            return "\n".join(lines)
+
+    # variables (from -stack-list-variables)
+    variables = results.get("variables")
+    if variables is not None and isinstance(variables, list):
+        lines = []
+        for var in variables:
+            name = var.get("name", "?")
+            value = var.get("value", "?")
+            lines.append(f"  {name} = {value}")
+        if lines:
+            return "\n".join(lines)
+
+    # Fallback
+    try:
+        return json.dumps(results, indent=2, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(results)
+
+
 def _brief_result(output: MIOutput) -> str:
     """Generate a brief human-readable summary of an MI command result.
 
     Used for command-echo logging so that every GDB command and its
     response are visible in the server terminal at INFO level.
+
+    For structured MI results (no console output), uses GDB-style
+    formatting for consistency with the MCP tools.
 
     Args:
         output: Parsed MI output from a command execution.
@@ -71,12 +205,8 @@ def _brief_result(output: MIOutput) -> str:
         # Trim to at most 500 characters to avoid flooding the terminal
         return text[:500] + ("..." if len(text) > 500 else "")
     if output.result and output.result.results:
-        try:
-            formatted = json.dumps(
-                output.result.results, indent=2, ensure_ascii=False
-            )
-        except (TypeError, ValueError):
-            formatted = str(output.result.results)
+        # 使用 GDB CLI 风格格式化（与 MCP 工具一致）
+        formatted = _format_mi_result(output.result.results)
         return formatted[:500] + ("..." if len(formatted) > 500 else "")
     return "OK"
 
