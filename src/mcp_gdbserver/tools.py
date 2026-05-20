@@ -159,7 +159,6 @@ def register_tools(mcp: FastMCP) -> None:
             return str(_result_dict(
                 True,
                 f"GDB server started (mode={mode}, PID={status['pid']})",
-                mode=mode,
                 **status,
             ))
         except GdbServerError as e:
